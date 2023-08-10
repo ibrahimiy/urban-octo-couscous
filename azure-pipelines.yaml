@@ -1,0 +1,221 @@
+#This template contains the yaml code for the infrastructure deployment of the input finance application
+trigger: none
+
+#The parameters section defines the runtime parameter the pipline displays in its UI
+parameters:
+  - name: location
+    displayName: Azure Region
+    default: 'eastus'
+  - name: locationAbv
+    displayName: Azure Region Abbreviation
+    default: 'eus'  
+  - name: drLocation
+    displayName: DR Azure Region
+    default: 'westus'
+  - name: drLocationAbv
+    displayName: DR Azure Region Abbreviation
+    default: 'wus'
+  - name: stdrenvironment
+    displayName: Environment
+    values:
+      - dev
+      - qa
+      - uat
+      - prd
+      - other
+  - name: nonstdrenvironment
+    displayName: Other Environment Name
+  - name: application
+    displayName: Business Application (Application Abbreviation)
+  - name: businessUnit
+    displayName: Business Unit
+    default: 'Input Finance'
+  - name: applicationOwner
+    displayName: Application Owner
+    default: sameer.ranade@raboag.com
+  - name: costCenter
+    displayName: Cost Center
+    default: 50307
+  - name: vnetaddressprefix
+    displayName: VNET IP Prefix (RFC1918 X.X.X.0/24)
+  - name: drVnetaddressprefix
+    displayName: DR VNET IP Prefix (Only For Prod)
+    default: 'N/A'
+
+
+#The variables section defines values generated from evaluating logical expressions
+variables:
+- name: global_resource_group
+  value: 'global-rna-${{parameters.locationAbv}}-rg'
+- name: shared_resource_group
+  value: '${{parameters.stdrenvironment}}-rna-${{parameters.locationAbv}}-rg'
+- name: app_key_vault
+  value: '${{parameters.stdrenvironment}}-${{parameters.application}}-${{parameters.locationAbv}}-kv'
+- name: dr_resource_group
+  value: 'dr-${{parameters.application}}-${{parameters.drLocationAbv}}-rg'
+- name: dr_function_app
+  value: 'dr-${{parameters.application}}-${{parameters.drLocationAbv}}-func'
+- ${{if ne(parameters.stdrenvironment, 'prd')}}:
+  - name: az_svc_conn
+    value: 'reg-dev-am-inputfinance (SPN)'
+  - name: sa_replication_type
+    value: 'Standard_LRS'
+- ${{if eq(parameters.stdrenvironment, 'prd')}}:
+  - name: az_svc_conn
+    value: 'reg-dev-am-inputfinance (SPN)'
+  - name: sa_replication_type
+    value: 'Standard_GRS'
+- ${{if eq(parameters.stdrenvironment, 'other')}}:
+  - name: environment
+    value: ${{parameters.nonstdrenvironment}}
+  - name: app_resource_group
+    value: '${{parameters.nonstdrenvironment}}-${{parameters.application}}-${{parameters.locationAbv}}-rg'
+- ${{if ne(parameters.stdrenvironment, 'other')}}:
+  - name: environment
+    value: ${{parameters.stdrenvironment}}
+  - name: app_resource_group
+    value: '${{parameters.stdrenvironment}}-${{parameters.application}}-${{parameters.locationAbv}}-rg'
+- ${{if or(eq(variables.environment, 'dev'), eq(parameters.stdrenvironment, 'other'))}}:
+  - group: DEV_If_Infrastructure
+- ${{if eq(variables.environment, 'qa')}}:
+  - group: QA_If_Infrastructure
+- ${{if eq(variables.environment, 'uat')}}:
+  - group: UAT_If_Infrastructure
+- ${{if eq(variables.environment, 'prd')}}:
+  - group: PRD_If_Infrastructure
+  
+
+
+
+  
+
+
+#This selects the VM image of the pipeline agent
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+  - stage: Infra_Deploy_Stage
+    displayName: Infrastructure Deployment
+    jobs:
+      - deployment: Infra_Deploy_Job
+        displayName: Infrastructure Deployment
+        environment: Infrastructure
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                #This task retrieves the object ID of the SPN to be used in the key vault access policy configuration
+                - task: AzureCLI@2
+                  displayName: Retrieve the SPN Object ID
+                  inputs:
+                    azureSubscription: $(az_svc_conn)
+                    addSpnToEnvironment: true
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "outputing the variable $(sa_replication_type)"
+                      spnOid=$(az ad sp list --spn $servicePrincipalId --query [].id -o tsv)
+                      echo "##vso[task.setvariable variable=spn_Oid;issecret=true]$spnOid"
+
+                #This task checks if the create date tag exists or not on the resource group
+                - task: AzureCLI@2
+                  displayName: Check Create Tag Status
+                  inputs:
+                    azureSubscription: $(az_svc_conn)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az group show --name $(app_resource_group) &> /dev/null
+                      if [ $? -eq 0 ]; then
+                        tagValue=$(az group show --name $(app_resource_group) --query tags.'"create date"' --output tsv)
+                        if [ -n "$tagValue"]; then
+                          echo "##vso[task.setvariable variable=create_date;]$tagValue"
+                        else
+                          currentDate=$(date +%Y-%m-%d)
+                          echo "##vso[task.setvariable variable=create_date;]$currentDate"
+                        fi
+                      else
+                        echo "the resource group $(app_resource_group) does not exist"
+                      fi
+
+                #Task to create the DR resource group when deploying the production environment      
+                - task: AzureCLI@2
+                  condition: eq('${{parameters.stdrenvironment}}', 'prd')
+                  displayName: Create The DR Resource Group
+                  inputs:
+                    azureSubscription: $(az_svc_conn)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "Creating the DR resource group"
+                      az group create --name $(dr_resource_group) --location ${{parameters.drLocation}}
+                      
+                #This task deploys the main bicep template to provision the application infrastructure
+                - task: AzureResourceManagerTemplateDeployment@3
+                  displayName: Deploy API Infrastructure
+                  inputs:
+                    deploymentScope: 'Resource Group'
+                    azureResourceManagerConnection: $(az_svc_conn)
+                    action: 'Create Or Update Resource Group'
+                    resourceGroupName: $(app_resource_group)
+                    location: ${{parameters.location}}
+                    templateLocation: 'Linked artifact'
+                    csmFile: './main.bicep'
+                    overrideParameters: '-drLocation ${{parameters.drLocation}} -drLocationAbv ${{parameters.drLocationAbv}} -drVnetAddressPrefix ${{parameters.drVnetAddressPrefix}} -saReplicationType $(sa_replication_type) -createDate $(create_date) -vfProxyServiceSubKey $(vf_Proxy_Service_Sub_Key) -vfProxyServiceUrl $(vf_proxy_service_url) -tokenValidationEndpoint $(token_validation_endpoint) -vnetAddressPrefix ${{parameters.vnetAddressPrefix}} -costCenter ${{parameters.costCenter}} -applicationOwner ${{parameters.applicationOwner}} -businessUnit "${{parameters.businessUnit}}" -application ${{parameters.application}} -environment $(environment) -locationAbv ${{parameters.locationAbv}} -location ${{parameters.location}} -spnOid $(spn_Oid)'
+                    deploymentMode: 'Incremental'
+
+                #This task will deploy the shared bicep template      
+                - task: AzureResourceManagerTemplateDeployment@3
+                  displayName: Deploy Shared Components
+                  condition: ne('${{parameters.stdrenvironment}}', 'other')
+                  inputs:
+                    deploymentScope: 'Resource Group'
+                    azureResourceManagerConnection: $(az_svc_conn)
+                    action: 'Create Or Update Resource Group'
+                    resourceGroupName: $(shared_resource_group)
+                    location: ${{parameters.location}}
+                    templateLocation: 'Linked artifact'
+                    csmFile: './shared-infra.bicep'
+                    overrideParameters: '-drLocation ${{parameters.drLocation}} -drLocationAbv ${{parameters.drLocationAbv}} -createDate $(create_date) -costCenter ${{parameters.costCenter}} -applicationOwner ${{parameters.applicationOwner}} -businessUnit "${{parameters.businessUnit}}" -environment $(environment) -locationAbv ${{parameters.locationAbv}} -location ${{parameters.location}}'
+                    deploymentMode: 'Incremental'
+
+                #This task will deploy the shared bicep template      
+                - task: AzureResourceManagerTemplateDeployment@3
+                  displayName: Deploy Global Components
+                  condition: eq('${{parameters.stdrenvironment}}', 'prd')
+                  inputs:
+                    deploymentScope: 'Resource Group'
+                    azureResourceManagerConnection: $(az_svc_conn)
+                    action: 'Create Or Update Resource Group'
+                    resourceGroupName: $(global_resource_group)
+                    location: ${{parameters.location}}
+                    templateLocation: 'Linked artifact'
+                    csmFile: './global-infra.bicep'
+                    overrideParameters: '-createDate $(create_date) -costCenter ${{parameters.costCenter}} -applicationOwner ${{parameters.applicationOwner}} -businessUnit "${{parameters.businessUnit}}" -application rna -environment global'
+                    deploymentMode: 'Incremental'
+
+                #This task assigns tags to the resource group
+                - task: AzureCLI@2
+                  displayName: Assign Tags To Resource Group
+                  inputs:
+                    azureSubscription: $(az_svc_conn)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "Assign Tags to the resource group"
+                      az group update --resource-group $(app_resource_group) --tags "create date"="$(create_date)" "application name"="${{parameters.application}}" "cost center"="${{parameters.costCenter}}" "application owner"="${{parameters.applicationOwner}}" "business unit"="${{parameters.businessUnit}}"
+                
+                #This task is used to assign the access policies to the key vault for the DR function app
+                - task: AzureCLI@2
+                  displayName: KeyVault Access Policy Configuration
+                  inputs:
+                    azureSubscription: $(az_svc_conn)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      echo "Assign Access policies to the dr azure function"
+                      func_identity=$(az functionapp show --name $(dr_function_app) --resource-group $(app_resource_group) --query identity.principalId -o tsv)
+                      az keyvault set-policy --name $(app_key_vault) --object-id $func_identity --secret-permissions get list
